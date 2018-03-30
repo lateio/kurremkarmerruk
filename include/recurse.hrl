@@ -1,0 +1,1 @@
+-record(tried, {servers=[],queries=[], afs=[]}).

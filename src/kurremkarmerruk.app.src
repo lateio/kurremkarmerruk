@@ -1,0 +1,31 @@
+{application, kurremkarmerruk,
+ [{description, "DNS server in Erlang"},
+  {vsn, "0.0.0"},
+  {registered, [
+    'client_connection_sup',
+    'kurremkarmerruk_server',
+    'kurremkarmerruk_cache',
+    'kurremkarmerruk_recurse',
+    %'kurremkarmerruk_zone',
+    'pool_worker_sup',
+    'udp_socket_worker_sup'
+  ]},
+  {mod, { kurremkarmerruk_app, []}},
+  {applications,
+   [kernel,
+    stdlib,
+    dnslib,
+    ranch
+   ]},
+  {env,[
+      {config_file, {priv_file, kurremkarmerruk, "sample_config"}},
+      {root_server_hints, {priv_file, kurremkarmerruk, "root_servers", [{class, in}]}}
+  ]},
+  {modules, [
+    'kurremkarmerruk_server'
+  ]},
+
+  {maintainers, ["Lauri Moisio"]},
+  {licenses, ["MIT"]},
+  {links, ["https://github.com/lateio/kurremkarmerruk"]}
+ ]}.

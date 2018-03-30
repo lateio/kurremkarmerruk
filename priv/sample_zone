@@ -1,0 +1,34 @@
+; sample_zone for kurremkarmerruk
+$ORIGIN sample.kurremkarmerruk.arv.io.
+$TTL 30min
+
+@       1min    IN      SOA     a.ns    hostmaster      (0 15min 15min 30min 1min)
+                        NS      @
+                        NS      a.ns
+                        A       127.0.0.1
+                        AAAA    ::1
+
+                        TXT     "Hello, world!"
+
+
+a.ns                    A       127.0.0.1
+                        AAAA    ::1
+
+
+*._tcp                  SRV     0 0 0 .
+
+idna                    A       0.0.0.0
+                        AAAA    ::
+                        TXT     "IDNA"
+
+Meowdy-do!              TXT     ""
+
+
+$PUNYENCODE true
+väinämöinen             CNAME   idna.sample.kurremkarmerruk.arv.io.
+
+$ORIGIN Влади́мир.sample.kurremkarmerruk.arv.io.
+@                       CNAME   idna.sample.kurremkarmerruk.arv.io.
+
+$ORIGIN sample.kurremkarmerruk.arv.io.
+eläkeikä 65years        TXT     ""
