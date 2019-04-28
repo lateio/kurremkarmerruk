@@ -1,12 +1,12 @@
 {application, kurremkarmerruk,
  [{description, "DNS server in Erlang"},
-  {vsn, "0.0.0"},
+  {vsn, "0.0.1"},
   {registered, [
+    % Need to update this...
     'client_connection_sup',
     'kurremkarmerruk_server',
     'kurremkarmerruk_cache',
     'kurremkarmerruk_recurse',
-    %'kurremkarmerruk_zone',
     'pool_worker_sup',
     'udp_socket_worker_sup'
   ]},
@@ -15,17 +15,25 @@
    [kernel,
     stdlib,
     dnslib,
-    ranch
+    ranch,
+    socketfd
    ]},
   {env,[
+      {root_server_hints, {priv_file, kurremkarmerruk, "root_servers", [{class, in}]}},
       {config_file, {priv_file, kurremkarmerruk, "sample_config"}},
-      {root_server_hints, {priv_file, kurremkarmerruk, "root_servers", [{class, in}]}}
+      {namespace_internal_default, #{
+          handlers => #{
+              '_' => [kurremkarmerruk_cache, kurremkarmerruk_recurse]
+          },
+          namespace_id => '__Internal__'
+      }}
   ]},
   {modules, [
+    % Need to update this...
     'kurremkarmerruk_server'
   ]},
 
   {maintainers, ["Lauri Moisio"]},
-  {licenses, ["MIT"]},
+  {licenses, ["ISC"]},
   {links, ["https://github.com/lateio/kurremkarmerruk"]}
  ]}.

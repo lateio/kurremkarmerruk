@@ -5,9 +5,6 @@
     resolve/3
 ]).
 
-% Shouldn't this check cache for answers when possible/allowed?
-
-
 resolve([Head|_] = Domain0) when is_integer(Head) ->
     {_, _, Domain} = dnslib:list_to_domain(Domain0),
     resolve(Domain, a, in);

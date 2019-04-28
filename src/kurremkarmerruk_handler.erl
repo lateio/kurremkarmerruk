@@ -1,26 +1,20 @@
 % ------------------------------------------------------------------------------
 %
-% Copyright (c) 2018, Lauri Moisio <l@arv.io>
+% Copyright © 2018-2019, Lauri Moisio <l@arv.io>
 %
-% The MIT License
+% The ISC License
 %
-% Permission is hereby granted, free of charge, to any person obtaining a copy
-% of this software and associated documentation files (the "Software"), to deal
-% in the Software without restriction, including without limitation the rights
-% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-% copies of the Software, and to permit persons to whom the Software is
-% furnished to do so, subject to the following conditions:
+% Permission to use, copy, modify, and/or distribute this software for any
+% purpose with or without fee is hereby granted, provided that the above
+% copyright notice and this permission notice appear in all copies.
 %
-% The above copyright notice and this permission notice shall be included in
-% all copies or substantial portions of the Software.
-%
-% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-% THE SOFTWARE.
+% THE SOFTWARE IS PROVIDED “AS IS” AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+% WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+% MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+% ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+% WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 %
 % ------------------------------------------------------------------------------
 %
@@ -29,20 +23,34 @@
     execute_handlers/2,
     add_answers/3,
     current_answers/2,
+    get_handlers/2,
     is_preceeded_by/3
 ]).
 
--callback execute(term(), term()) -> {ok, term()} | {stop, term()}.
+-include_lib("kernel/include/logger.hrl").
+
+-callback spawn_handler_proc()
+    -> boolean()
+     | {M :: atom(), F :: atom(), A :: list(term())}
+     | {M :: atom(), F :: atom(), A :: list(term()), Opts :: map()}.
+-callback execute(term(), term())
+    -> {'ok', term()}
+     | {'passthrough', [{Len :: 0..16#FFFF, iolist()}]} % Allow a form which is a list of binaries, which the
+     | {'stop', term()}
+     | 'drop'.
 -callback valid_opcodes() -> atom() | list(atom()).
 -callback config_init(map()) -> map().
 -callback config_keys() -> [atom()].
--callback handle_config(Key :: atom(), Config :: term(), Namespace :: map()) -> {'ok', map()}.
+-callback handle_config(Key :: atom(), Config :: term(), Namespace :: map())
+    -> {'ok', map()} | {'error', Reason :: term()}.
 -callback config_end(map()) -> map().
 
 -optional_callbacks([handle_config/3]).
 
 
 -spec execute_handlers(dnsmsg:message(), map() | 'undefined') -> {'ok', dnsmsg:message()} | 'drop'.
+execute_handlers(Msg = #{'Opcode' := Opcode}, _) when is_integer(Opcode) ->
+    {ok, dnsmsg:response(Msg, #{return_code => not_implemented})};
 execute_handlers(Msg, undefined) ->
     {ok, dnsmsg:response(Msg, #{return_code => refused})};
 execute_handlers(Msg0 = #{'Opcode' := Opcode}, Namespace = #{recurse := RecursionAvailable}) ->
@@ -50,27 +58,36 @@ execute_handlers(Msg0 = #{'Opcode' := Opcode}, Namespace = #{recurse := Recursio
     % This will prevent parallel handing of requests, but not for example a case
     % where the original message processing completes and after that a previously
     % buffered duplicate of that same message is undertaken again.
+    %
+    % Though repeatedly received message can act as a hint as to the timeout value of
+    % the sending client...
+    %
+    % What will happen if a message is ignored by each and every handler?
+    % Should add a flag that answers have been added to message... Or just pattern match it against the original?
     Hash = hash_message(Msg0),
     case ets:insert_new(client_requests, {Hash}) of
-        false -> drop;
+        false ->
+            drop;
         true ->
             case get_handlers(Opcode, Namespace) of
-                not_implemented -> dnsmsg:response(Msg0, #{recursion_available => RecursionAvailable, return_code => not_implemented});
+                not_implemented -> dnsmsg:response(Msg0, #{recursion_available => RecursionAvailable, return_code => refused});
                 Handlers ->
-                    try execute_handlers(Handlers, dnsmsg:set_response_header(Msg0#{'Response_Recursion_available' => RecursionAvailable}, [{return_code, ok}, {authoritative, true}]), Namespace#{opcode => Opcode}) of
+                    Msg1 = dnsmsg:set_response_header(Msg0, [{return_code, ok}, {authoritative, true}, {recursion_available, RecursionAvailable}]),
+                    Msg2 = Msg1#{questions => dnslib:deduplicate(dnsmsg:questions(Msg0))},
+                    try execute_handlers(Handlers, Msg2, Namespace#{opcode => Opcode}) of
                         drop -> drop;
-                        {ok, Msg1} ->
-                            Answers = finalize_answers(maps:get(handler_answers, Msg1)),
+                        {ok, Msg3} ->
+                            Answers = finalize_answers(maps:get(handler_answers, Msg3, [])),
                             case lists:partition(fun (FunTuple) -> is_tuple(element(2, FunTuple)) end, Answers) of
-                                {[], _} -> {ok, Msg2} = dnsmsg:apply_interpret_results(Answers, Msg1#{'Questions' := []});
+                                {[], _} -> {ok, Msg4} = dnsmsg:apply_interpret_results(Answers, Msg3#{'Questions' := []});
                                 {_Errors, _} ->
                                     % When we have errors (for any reason, return server_error)
-                                    OrigQuestions = [element(1, GenTuple) || GenTuple <- Answers],
-                                    Msg2 = dnsmsg:set_response_header(Msg1#{'Questions' := OrigQuestions}, return_code, server_error)
+                                    Msg4 = dnsmsg:set_response_header(Msg3, return_code, server_error)
                             end,
-                            {ok, dnsmsg:response(Msg2)};
+                            {ok, dnsmsg:response(Msg4)};
+                        {passthrough, _}=Tuple -> Tuple;
                         {server_error, Handler, Reason, Stacktrace} ->
-                            io:format("Handler ~p produced an exception ~p, Stacktrace: ~p~n", [Handler, Reason, Stacktrace]),
+                            ?LOG_ERROR("Handler ~p produced an exception ~p, Stacktrace: ~p~n", [Handler, Reason, Stacktrace]),
                             {ok, dnsmsg:response(Msg0, #{return_code => server_error})}
                     after
                         ets:delete(client_requests, Hash)
@@ -114,12 +131,13 @@ hash_message(Msg) ->
 -ifdef(OTP_RELEASE).
 execute_handlers([], Msg, _) ->
     {ok, Msg};
-execute_handlers(_, Msg = #{'Questions' := []}, _) ->
+execute_handlers(_, Msg = #{questions := []}, _) ->
     {ok, Msg};
 execute_handlers([Handler|Rest], Msg0, Namespace) ->
     try Handler:execute(Msg0, Namespace) of
         {ok, Msg1}   -> execute_handlers(Rest, Msg1, Namespace);
         {stop, Msg1} -> {ok, Msg1};
+        {passthrough, _}=Tuple -> Tuple;
         drop         -> drop
         % Should we catch and report invalid returns?
     catch
@@ -127,17 +145,19 @@ execute_handlers([Handler|Rest], Msg0, Namespace) ->
         error:Reason:Stacktrace -> {server_error, Handler, Reason, Stacktrace};
         {ok, Msg1}   -> execute_handlers(Rest, Msg1, Namespace);
         {stop, Msg1} -> {ok, Msg1};
+        {passthrough, _}=Tuple -> Tuple;
         drop         -> drop
     end.
 -else.
 execute_handlers([], Msg, _) ->
     {ok, Msg};
-execute_handlers(_, Msg = #{'Questions' := []}, _) ->
+execute_handlers(_, Msg = #{questions := []}, _) ->
     {ok, Msg};
 execute_handlers([Handler|Rest], Msg0, Namespace) ->
     try Handler:execute(Msg0, Namespace) of
         {ok, Msg1}   -> execute_handlers(Rest, Msg1, Namespace);
         {stop, Msg1} -> {ok, Msg1};
+        {passthrough, _}=Tuple -> Tuple;
         drop         -> drop
         % Should we catch and report invalid returns?
     catch
@@ -145,6 +165,7 @@ execute_handlers([Handler|Rest], Msg0, Namespace) ->
         error:Reason -> {server_error, Handler, Reason, erlang:get_stacktrace()};
         {ok, Msg1}   -> execute_handlers(Rest, Msg1, Namespace);
         {stop, Msg1} -> {ok, Msg1};
+        {passthrough, _}=Tuple -> Tuple;
         drop         -> drop
     end.
 -endif.
@@ -165,7 +186,7 @@ final_answer_fun(_) -> true.
 
 chase_cnames_fun(Domain) ->
     fun
-        ({_, cname, {CnameRr, _}}) -> dnslib:normalize(element(5, CnameRr)) =:= Domain
+        ({_, cname, {CnameRr, _}}) -> dnslib:normalize_domain(element(5, CnameRr)) =:= Domain
     end.
 
 
@@ -173,7 +194,7 @@ chase_cnames([], Others, Acc) ->
     drop_duplicate_answers(lists:append(lists:reverse(Acc), Others), #{});
 chase_cnames([Answer|Rest], Others, Acc) ->
     Question = element(1, Answer),
-    Domain = dnslib:normalize(element(1, Question)),
+    Domain = dnslib:normalize_domain(element(1, Question)),
     case lists:partition(chase_cnames_fun(Domain), Others) of
         {[], _} -> chase_cnames(Rest, Others, [Answer|Acc]);
         {[{OriginalQuestion, cname, {CnameRr, CnameResources}}], Others1} ->
@@ -187,18 +208,18 @@ chase_cnames([Answer|Rest], Others, Acc) ->
                 {_, _} -> Answer
             end,
             Answer2 = setelement(1, Answer1, OriginalQuestion),
-            Rest1 = [GenTuple || GenTuple <- Rest, dnslib:normalize(element(1, element(1, GenTuple))) =/= Domain],
+            Rest1 = [GenTuple || GenTuple <- Rest, dnslib:normalize_domain(element(1, element(1, GenTuple))) =/= Domain],
             % Since we know that this or that Domain is a followed cname, we should drop all other
             % results for that domain
             chase_cnames(Rest1, Others1, [Answer2|Acc])
     end.
 
 
-% Some answer are terminal, other in progress.
+% Some answers are terminal, other in progress. Final boolean in addition to Authoritative
 add_answers([], _, Message) ->
     Message;
 add_answers(Answers, Authoritative, Message) ->
-    CurrentAuthoritative = maps:get('Response_Authoritative', Message, true),
+    CurrentAuthoritative = maps:get('Authoritative', maps:get('Response', Message), true),
     Message1 = dnsmsg:set_response_header(Message, authoritative, Authoritative andalso CurrentAuthoritative),
     add_answers1(Answers, maps:get(handler_answers, Message1, []), Message1).
 
@@ -206,21 +227,21 @@ add_answers1([], Acc, Message) ->
     Message#{handler_answers => Acc};
 add_answers1([{_, _}=Tuple|Rest], Acc, Message) ->
     add_answers1(Rest, [Tuple|Acc], Message);
-add_answers1([{Question, AnswerType, _}=Tuple|Rest], Acc, Message = #{'Questions' := Questions})
+add_answers1([{Question, AnswerType, _}=Tuple|Rest], Acc, Message = #{questions := Questions})
 when AnswerType =:= ok; AnswerType =:= nodata; AnswerType =:= name_error; AnswerType =:= cname_loop ->
     Questions1 = [GenTuple || GenTuple <- Questions, GenTuple =/= Question],
-    add_answers1(Rest, [Tuple|Acc], Message#{'Questions' => Questions1});
-add_answers1([{{_, Type, Class}=Question, cname, {{_, _, _, _, CnameDomain}, _}}=Tuple|Rest], Acc, Message = #{'Questions' := Questions}) ->
+    add_answers1(Rest, [Tuple|Acc], Message#{questions => Questions1});
+add_answers1([{{_, Type, Class}=Question, cname, {{_, _, _, _, CnameDomain}, _}}=Tuple|Rest], Acc, Message = #{questions := Questions}) ->
     Questions1 = [GenTuple || GenTuple <- Questions, GenTuple =/= Question],
-    add_answers1(Rest, [Tuple|Acc], Message#{'Questions' => [{CnameDomain, Type, Class}|Questions1]});
+    add_answers1(Rest, [Tuple|Acc], Message#{questions => [{CnameDomain, Type, Class}|Questions1]});
 add_answers1([{_, ReferralType, _}=Tuple|Rest], Acc, Message)
 when ReferralType =:= referral; ReferralType =:= addressless_referral ->
     add_answers1(Rest, [Tuple|Acc], Message);
-add_answers1([{{_, Type, Class}=Question, cname_referral, {{_, _, _, _, CnameDomain}=CnameRr, Referral, Resources}}|Rest], Acc, Message = #{'Questions' := Questions}) ->
+add_answers1([{{_, Type, Class}=Question, cname_referral, {{_, _, _, _, CnameDomain}=CnameRr, Referral, Resources}}|Rest], Acc, Message = #{questions := Questions}) ->
     Questions1 = [GenTuple || GenTuple <- Questions, GenTuple =/= Question],
     NewQuestion = {CnameDomain, Type, Class},
     CnameTuple = {Question, cname, {CnameRr, Resources}},
-    add_answers1(Rest, [Referral, CnameTuple|Acc], Message#{'Questions' => [NewQuestion|Questions1]}).
+    add_answers1(Rest, [Referral, CnameTuple|Acc], Message#{questions => [NewQuestion|Questions1]}).
 
 
 drop_duplicate_answers([], Answers) ->
@@ -240,6 +261,7 @@ get_handlers(Opcode, #{handlers := HandlersMap}) ->
 is_preceeded_by(What, ByWhich, Namespace = #{opcode := Opcode}) ->
     case get_handlers(Opcode, Namespace) of
         not_implemented -> false;
+        [] -> false;
         List ->
             {Before, _} = lists:splitwith(fun (Handler) -> Handler =/= What end, List),
             lists:member(ByWhich, Before)

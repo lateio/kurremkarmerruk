@@ -1,26 +1,20 @@
 % ------------------------------------------------------------------------------
 %
-% Copyright (c) 2018, Lauri Moisio <l@arv.io>
+% Copyright © 2018-2019, Lauri Moisio <l@arv.io>
 %
-% The MIT License
+% The ISC License
 %
-% Permission is hereby granted, free of charge, to any person obtaining a copy
-% of this software and associated documentation files (the "Software"), to deal
-% in the Software without restriction, including without limitation the rights
-% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-% copies of the Software, and to permit persons to whom the Software is
-% furnished to do so, subject to the following conditions:
+% Permission to use, copy, modify, and/or distribute this software for any
+% purpose with or without fee is hereby granted, provided that the above
+% copyright notice and this permission notice appear in all copies.
 %
-% The above copyright notice and this permission notice shall be included in
-% all copies or substantial portions of the Software.
-%
-% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-% THE SOFTWARE.
+% THE SOFTWARE IS PROVIDED “AS IS” AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+% WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+% MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+% ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+% WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 %
 % ------------------------------------------------------------------------------
 %
@@ -29,7 +23,8 @@
     parse_netmask/1,
     parse_host_port/2,
     limit_answer_ttls/4,
-    cname_resource_loop/1
+    cname_resource_loop/1,
+    write_terms/2
 ]).
 
 
@@ -50,13 +45,13 @@ parse_netmask(Netmask) ->
     of
         {ok, {_, _, _, _} = Address} ->
             case Tail of
-                [] -> {ok, Address};
+                [] -> {ok, {Address, 32}};
                 [Length] when Length >= 0, Length =< 32 -> {ok, {Address, Length}};
                 _ -> error
             end;
         {ok, {_, _, _, _, _, _, _, _} = Address} ->
             case Tail of
-                [] -> {ok, Address};
+                [] -> {ok, {Address, 128}};
                 [Length] when Length >= 0, Length =< 128 -> {ok, {Address, Length}};
                 _ -> error
             end;
@@ -64,7 +59,8 @@ parse_netmask(Netmask) ->
     end.
 
 
--spec parse_host_port(string(), inet:port_number()) -> {'ok', {inet:ip_address(), inet:port_number()}} | 'error'.
+-spec parse_host_port(string(), inet:port_number() | 'default')
+    -> {'ok', {inet:ip_address(), inet:port_number() | 'default'}} | 'error'.
 parse_host_port([$[|Rest], _) ->
     [IPStr, [$:|PortStr]] = string:split(Rest, "]", trailing),
     {ok, Address} = inet:parse_ipv6strict_address(IPStr),
@@ -82,7 +78,7 @@ parse_host_port(Str, DefaultPort) ->
                         {ok, Address} when Port > 0, Port < 16#FFFF -> {ok, {Address, Port}};
                         _ when Port > 0, Port < 16#FFFF ->
                             case dnslib:list_to_domain(IPStr) of
-                                {_, false, Domain} when Domain =/= [] ->
+                                {ok, _, [Head|_] = Domain} when Domain =/= [], Head =/= '_' ->
                                     true = dnslib:is_valid_hostname(Domain),
                                     {ok, {Domain, Port}}
                             end
@@ -92,7 +88,7 @@ parse_host_port(Str, DefaultPort) ->
                         {ok, Address} -> {ok, {Address, DefaultPort}};
                         _ ->
                             case dnslib:list_to_domain(Str) of
-                                {_, false, Domain} when Domain =/= [] ->
+                                {ok, _, [Head|_] = Domain} when Domain =/= [], Head =/= '_' ->
                                     true = dnslib:is_valid_hostname(Domain),
                                     {ok, {Domain, DefaultPort}}
                             end
@@ -107,7 +103,7 @@ limit_answer_ttls([{_, AnswerType, Resources0}=Tuple|Rest], MaxTtl, MaxNegTtl, A
 when AnswerType =:= ok; AnswerType =:= addressless_referral; AnswerType =:= cname_loop ->
     Resources = [setelement(4, GenTuple, min(GenTtl, MaxTtl)) || {_, _, _, GenTtl, _}=GenTuple <- Resources0],
     limit_answer_ttls(Rest, MaxTtl, MaxNegTtl, [setelement(3, Tuple, Resources)|Acc]);
-limit_answer_ttls([{_, cname, {{_, _, _, CnameTtl}=CnameRr, Resources0}}=Tuple|Rest], MaxTtl, MaxNegTtl, Acc) ->
+limit_answer_ttls([{_, cname, {{_, _, _, CnameTtl, _}=CnameRr, Resources0}}=Tuple|Rest], MaxTtl, MaxNegTtl, Acc) ->
     Resources = [setelement(4, GenTuple, min(GenTtl, MaxTtl)) || {_, _, _, GenTtl, _}=GenTuple <- Resources0],
     limit_answer_ttls(Rest, MaxTtl, MaxNegTtl, [setelement(3, Tuple, {setelement(4, CnameRr, min(CnameTtl, MaxTtl)), Resources})|Acc]);
 limit_answer_ttls([{_, referral, Resources0}=Tuple|Rest], MaxTtl, MaxNegTtl, Acc) ->
@@ -123,10 +119,17 @@ limit_answer_ttls([Tuple|Rest], MaxTtl, MaxNegTtl, Acc) when tuple_size(Tuple) =
 
 cname_resource_loop([]) -> false;
 cname_resource_loop([{_, cname, _, _, _}=Cname|Rest]) ->
-    Domain = dnslib:normalize(element(5, Cname)),
-    case [GenTuple || GenTuple <- Rest, dnslib:normalize(element(1, GenTuple)) =:= Domain] of
+    Domain = dnslib:normalize_domain(element(5, Cname)),
+    case [GenTuple || GenTuple <- Rest, dnslib:normalize_domain(element(1, GenTuple)) =:= Domain] of
         [] -> cname_resource_loop(Rest);
         _ -> true
     end;
 cname_resource_loop([_|Rest]) ->
     cname_resource_loop(Rest).
+
+
+write_terms(Filename, List) ->
+    Format = fun(Term) -> io_lib:format("~tp.~n", [Term]) end,
+    Text = lists:map(Format, List),
+    ok = file:write_file(Filename, Text),
+    ok.

@@ -1,0 +1,33 @@
+= The Design of Kurremkarmerruk
+Lauri Moisio <l@arv.io>
+Version 0.0.1, 2019.04.27
+:ext-relative: {outfilesuffix}
+
+== Structure
+
+Kurremkarmerruk adopts the basic OTP application model and can thus be represented as a supervision tree.
+
+image::supervision_tree.png[Kurremkarmerruk supervision tree]
+
+Kurremkarmerruk uses user configurable handlers to handle arriving requests. These handlers can, if necessary, elect to start a process to support their execution under the `kurremkarmerruk_handlers_sup` supervisor on Kurremkarmerruk startup
+. Depending on what the handler needs to do, this process can be for example a `gen_server` or alternatively another `supervisor`. For example, `kurremkarmerruk_recurse` handler – which is responsible for querying remote servers – starts a `supervisor` overseeing a few `gen_server` processes and a `supervisor` process overseeing any client connections which need to be established.
+
+`kurremkarmerruk_server` is responsible for handling the configuration of the server. It compiles a number of different address/subnet keyed configurations from the configuration, which will then get applied to arriving messages based on the client ip address and will govern how the message is handled: recursing might be allowed for certain subnet and a different version of a zone might be visible depending on the client address. Given how central the idea of address matched configurations is to Kurremkarmerruk, it could be called a "shatter-brained" name server.
+
+`socket_sup` oversees the processes responsible for creating our TCP and UDP sockets and also the workers handling the messages arriving on UDP sockets. At the time of writing, Kurremkarmerruk duplicates bound UDP sockets to allow multiple processes to accept messages on them. Although this allows a degree of concurrency, Kurremkarmerruk will likely in the future migrate towards a setup where this coupling between a socket and a worker is split in such a way that the sockets will feed messages to a pool of workers. This is to be done to allow for better control of the message queue – as the messages would get queued in the worker processes rather than be left in the kernel buffers – and to allow the number of workers to grow without consuming (and potentially exhausting) all the file descriptors afforded to the Beam emulator.
+
+`ranch` application is responsible for the TCP/TLS client connections Kurremkarmerruk is receives.
+
+== Message handling
+
+When Kurremkarmerruk receives a request, the worker receiving that message will try to find a configuration based on the client address. If no matching configuration is found, a response with return code `'refused'` is returned. Otherwise processing continues. It should be noted that at the time of writing Kurremkarmerruk doesn't implement any way of rate-limiting arrived messages and/or other denial of service (DOS) protections/mitigations.
+
+Based on the request opcode, a list of user configurable handlers gets applied to the message. These are applied in order, from first to last, unless a handler before the last one elected to drop the message or in some other way declared the message handling complete. As at the time of writing no opcode other than `'query'` is implemented, the structure of message handling is likely not general/robust enough to accommodate the complete range of operations that are required to support the different opcodes defined by various DNS related specs and changes will have to be made.
+
+Currently a worker handles a message from start to completion before tackling the next one. However, given that DNS mostly consist of waiting, it might be desirable to somehow allow workers to start work on other messages while they are waiting for responses/timeouts. For example, if a worker sends a request for some query to a remote server, assuming that the response to that message is going to take some tens of milliseconds to arrive, the worker could fulfill a number of other messages from cache or send the remote queries required by those messages before the response to the previous query arrives. This would (potentially) improve latency for the clients with better pipelining and also increase server throughput.
+
+Although given how other Erlang projects have been capable of feats like two million simultaneous TCP connections on a single large server, it could also turn out that complicating workers with such multiplexing is unnecessary, as Erlang processes might prove sufficiently cheap so as to allow better pipelining not through concurrent message handling in a process but via messages handled by concurrent worker processes. This remains to be seen.
+
+Next we'll take a look at link:configuration{ext-relative}[configuring Kurremkarmerruk].
+
+link:index{ext-relative}[Index]

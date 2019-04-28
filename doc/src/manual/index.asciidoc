@@ -1,0 +1,48 @@
+= Kurremkarmerruk 0.0.1 manual
+Lauri Moisio <l@arv.io>
+Version 0.0.1, 2019.04.09
+:ext-relative: {outfilesuffix}
+
+== Introduction
+
+Kurremkarmerruk will be a standards compliant, reliable and extensible Domain Name System (DNS) server. It will be able to act as an authoritative and/or a caching and recursing name server, with different alternative backends for both zone and cache storage. At the time of writing, however, it lacks the testing – and in some cases implementation and clear design vision – to verify it as any of the aforementioned.
+
+Kurremkarmerruk is written in link:http://erlang.org[Erlang] because the language offers a well-established, proven model for concurrency and asynchrony, both properties which are useful for DNS.
+
+=== Stability and usability
+
+Kurremkarmerruk is a work in progress and has seen little use and even less testing. The overall design is still in flux in such a way that it is still unnecessarily hard to reason/verify that it works correctly. Additionally, it is currently inadequate for hostile environments (like the internet) as it does not yet implement any denial of service (DOS) protections.
+
+At the time of writing Kurremkarmerruk should thus be considered inadequately tested for important/serious deployments. Furthermore, this documentation does not currently support the setup, deployment and operation of Kurremkarmerruk by users without extensive prior knowledge of the project. Rectifying the shortcomings of this documentation is an important, ongoing priority.
+
+=== Supported platforms
+
+Kurremkarmerruk is developed and tested for Erlang/OTP 20+, on macOS and Linux.
+
+=== Versioning
+
+Kurremkarmerruk is a new project and still very much in flux. Limited stability should be expected for versions before 1.0.0.
+
+After 1.0.0, Kurremkarmerruk will adopt the standard semantic versioning.
+
+You can find the source code for link:https://github.com/lateio/kurremkarmerruk[Kurremkarmerruk on Github].
+
+=== Dependencies
+
+* Kurremkarmerruk uses link:https://github.com/ninenines/ranch[ranch] by link:https://ninenines.eu[Loïc Hoguin] et al. for handling TCP/TLS connections
+* Kurremkarmerruk uses link:https://github.com/lateio/dnslib[dnslib] by the author for handling DNS messages, master files and other related data
+* Kurremkarmerruk uses link:https://github.com/lateio/socketfd[socketfd] by the author for duplicating UDP sockets for simultaneous use by multiple threads (likely to change in the future)
+
+=== License
+
+Kurremkarmerruk is released under the link:LICENSE.txt[ISC license].
+
+== Manual Contents
+
+1. link:dns{ext-relative}[Thinking about DNS]
+2. link:design{ext-relative}[Design of Kurremkarmerruk]
+3. link:configuration{ext-relative}[Configuration]
+
+----
+May you find something you could put in DNS for the max TTL.
+----

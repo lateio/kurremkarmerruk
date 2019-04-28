@@ -3,13 +3,15 @@
 %% @end
 %%%-------------------------------------------------------------------
 
--module(client_connection_sup).
+-module(socket_sup).
 
 -behaviour(supervisor).
--export([init/1]).
 
 %% API
--export([start_link/0,start_resolver/3]).
+-export([start_link/0]).
+
+%% Supervisor callbacks
+-export([init/1]).
 
 -define(SERVER, ?MODULE).
 
@@ -26,19 +28,23 @@ start_link() ->
 
 %% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
 init([]) ->
-    {ok, { {simple_one_for_one, 10, 5}, [
+    {ok, { {one_for_one, 2, 2}, [
         #{
-            id       => nil,
-            start    => {?MODULE, start_resolver, []},
-            type     => worker,
-            restart  => temporary,
-            shutdown => 1000
+            id => stream_socket_control_server,
+            start => {stream_socket_control_server, start_link, []},
+            type => worker,
+            restart => permanent,
+            shutdown => 2000
+        },
+        #{
+            id => udp_sup,
+            start => {udp_sup, start_link, []},
+            type => supervisor,
+            restart => permanent,
+            shutdown => 5000
         }
     ]} }.
 
 %%====================================================================
 %% Internal functions
 %%====================================================================
-
-start_resolver(Mod, Owner, Opts) ->
-    Mod:start_link(Owner, Opts).

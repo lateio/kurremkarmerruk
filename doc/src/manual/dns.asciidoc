@@ -1,0 +1,31 @@
+= Thinking About DNS
+Lauri Moisio <l@arv.io>
+Version 0.0.1, 2019.04.27
+:ext-relative: {outfilesuffix}
+
+How can a sub-millisecond operation take over a second? Isn't a DNS query after all just a key-value lookup?
+
+[source,erlang]
+----
+Resources = maps:get(Domain, Zone).
+----
+
+The culprit is not hard to pinpoint: network latency between local hosts using Wi-Fi is at best over a millisecond and at worst substantially more than that, name servers offered by your ISP are about 20 milliseconds away, root name servers might be a 20 to 60 milliseconds round-trip and you might be separated from the name server for ghibli.jp by something like 200 milliseconds. And all those numbers are likely to get worse depending on how bad your broadband connection is, not to mention if you were forced to use a 3G hotspot.
+
+Network latency quickly towers over other concerns when it comes to DNS performance; the more we have to consult non-local name servers to acquire the information we need, the longer it is going to take. This of course follows from the distributed nature of DNS and is also why caching has always been an important part of the protocol.
+
+----
+Matter is mostly nothing, DNS is mostly waiting.
+----
+
+Thus the best thing a DNS client/server can do is to avoid going over the network whenever possible – caching both resources and certain errors – and being smart about how to go over the network when it is required. Depending on the situation, this might range from trivial to rather complicated.
+
+In the case of a stub resolver – that is, a resolver relying on other resolver to do the more complicated recursing – this might mean maintaining some basic latency statistics about the configured servers, mainly communicating with the closest one and setting reasonable timeout values for resending messages. There's a limited number of servers with which to communicate with and the configuration remains more or less the same regardless of the query.
+
+For recursing resolvers, the task can involve sending any number of varying messages to previously unknown servers. Depending on how lucky the resolver happens to be about finding the intermediary answers in its cache, the task completion overall may take much longer than any situation a stub resolver might encounter. In the case of a recursing server, the client may resend and eventually timeout the request and thus the server is also facing an unknown deadline before which to complete the query (or maybe just report an error if the answer could not be reached in time).
+
+This network picture, combined with the fact that DNS message handling is mostly fairly simple parsing and short string comparisons, means that at any given moment a resolver is more than likely waiting for a message to arrive (a new request or a response to some previously sent request) or for a timeout to lapse.
+
+With this insight in hand, let's continue on to the link:design{ext-relative}[design of Kurremkarmerruk].
+
+link:index{ext-relative}[Index]

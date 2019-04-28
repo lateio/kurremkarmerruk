@@ -1,0 +1,126 @@
+= Configuration
+Lauri Moisio <l@arv.io>
+Version 0.0.1, 2019.04.27
+:ext-relative: {outfilesuffix}
+
+== Configuration
+
+By default Kurremkarmerruk looks for a configuration file called `"sample_config"` in its `priv/` directory. This in configurable however, and can be changed by modifying the configuration parameter `'config_file'` in the application resource file. Either of the allowed forms can be used:
+
+`{'priv', Application $$::$$ atom(), Path $$::$$ string()}`::
+
+Kurremkarmerruk will look for `Path` in the `priv/` directory of `Application`.
+
+`{'file', Path $$::$$ string()}`::
+
+Kurremkarmerruk expects `Path` is a configuration file.
+
+=== Configuration file
+
+Kurremkarmerruk configuration file consists of Erlang terms. It can contain a few global options and a list of configuration specs. A small configuration file might look like this:
+
+[source,erlang]
+----
+{'port', 8053}. % UDP/TCP port to use. Default is 53
+
+{'address', ["127.0.0.1","::1"]}. % Which addresses to bind. Default is IPv4/6 wildcards.
+
+{'udp_socket_workers', 10}. % Among how many workers a UDP socket is duplicated.
+
+{'data_dir', "/var/lib/kurremkarmerruk"}. % Directory for storing data, for example cached zone transfers
+
+{'config', [
+    {"127.0.0.1", [                             % Matches only the loopback address
+        {'zone',    {'file', "/example.zone"}}, % Serve zone found in file "example.zone"
+        {'recurse', ["one.one.one.one"]}        % Recurse to server "one.one.one.one" for other queries
+    ]},
+    {["10.0.0.0/8", "::1"], [    % Matches a subnet and IPv6 loopback
+        {'recurse', ["1.1.1.1"]} % Recurse to 1.1.1.1 for queries
+    ]},
+    {"10.0.0.2", [          % Matches a single address
+        {'recurse', 'true'} % For whatever reason, recurse from root servers upwards for this host
+    ]},
+    {'_', [ % '_' acts as a catch-all
+        % Acquire zone via zone transfer from ns1.example.com and serve it
+        {'zone',    {'transfer', "example.com", "in", [], "ns1.example.com"}},
+        {'cache',   'false'},  % But don't answer from cache
+        {'recurse', 'false'}   % And don't recurse for answers
+    ]}
+]}.
+----
+
+As you can see, after the couple global options the address matched configurations in the `'config'` list make up the bulk of the configuration. Obviously making specific settings for `10.0.0.0/8` addresses does not make any sense since we're only binding the loopback addresses, but it illustrates how the configuration is structured.
+
+Each handler can register and then handle the configuration keys they need: only the handler responsible for authoritative zones is interested in the `'zone'` parameter, `'cache'` is only of interest to cache and so forth.
+
+==== Global parameters
+
+The default value is given in parentheses when applicable.
+
+`{'port', inet:port_number()}` (`53`)::
+
+Set the port on which Kurremkarmerruk listens for UDP messages and TCP connections.
+
+`{'address', inet:ip_address() | string() | [inet:ip_address() | string()]}`::
+
+Set the address(es) Kurremkarmerruk will bind to to receive UDP/TCP data. By default Kurremkarmerruk will try to bind IPv4/6 wildcard addresses and will crash if it can acquire neither.
+
+`{'udp_socket_workers', pos_integer()}` (`10`)::
+
+Set the number of workers that are created per bound UDP socket.
+
+`{'data_dir', string()}`::
+
+Set the directory in which Kurremkarmerruk can write data.
+
+==== Address matched config
+
+[source,erlang]
+----
+address_match() =
+      string() % Either an ip address or CIDR notation
+    | inet:ip_address()
+    | {inet:ip_address(), 0..128}. % Netmask
+
+address_match_any() = '_'.
+
+{address_match() | [address_match()] | address_match_any(), [opt()]}.
+----
+
+First argument specifies the address(es) for which the configuration applies.
+
+==== Zone settings
+
+[source,erlang]
+----
+{'zone',
+      {'file', Path :: string()}
+    | {'file', Path :: string(), Opts :: [term()]}
+    | {'priv_file', Application :: atom(), Path :: string()}
+    | {'priv_file', Application :: atom(), Path :: string(), Opts :: [term()]}
+    | {'dir', Path :: string()}
+    | {'dir', Path :: string(), Opts :: [term()]}
+    | {'priv_dir', Application :: atom(), Path :: string()}
+    | {'priv_dir', Application :: atom(), Path :: string(), Opts :: [term()]}
+    | {'transfer', Apex :: string()}
+    | {'transfer', Apex :: string(), Class :: string()}
+    | {'transfer', Apex :: string(), Class :: string(), Opts :: [term()]}
+    | {'transfer', Apex :: string(), Class :: string(), Opts :: [term()], Servers :: [string()]}
+}.
+----
+
+==== Cache settings
+
+[source,erlang]
+----
+{'cache', boolean()}.
+----
+
+==== Recurse settings
+
+[source,erlang]
+----
+{'recurse', boolean() | string() | inet:ip_address() | [string() | inet:ip_address()]}.
+----
+
+link:index{ext-relative}[Index]

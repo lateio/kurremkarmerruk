@@ -3,17 +3,13 @@
 %% @end
 %%%-------------------------------------------------------------------
 
-% Split udp socket pool from kurremkarmerruk, somewhat like ranch?
-
--module(udp_socket_worker_sup).
+-module(kurremkarmerruk_recurse_client_sup).
 
 -behaviour(supervisor).
+-export([init/1]).
 
 %% API
--export([start_link/0]).
-
-%% Supervisor callbacks
--export([init/1]).
+-export([start_link/0,start_resolver/3]).
 
 -define(SERVER, ?MODULE).
 
@@ -30,19 +26,19 @@ start_link() ->
 
 %% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
 init([]) ->
-    Sockets = udp_socket_control_server:socketfds(),
-    ChildSpecs = [
+    {ok, { {simple_one_for_one, 10, 5}, [
         #{
-            id => {udp_worker, socketfd:get(GenSocketfd)},
-            start => {udp_socket_worker, start_link, [GenSocketfd]},
-            type => worker,
-            restart => permanent,
-            shutdown => 2000
+            id       => nil,
+            start    => {?MODULE, start_resolver, []},
+            type     => worker,
+            restart  => temporary,
+            shutdown => 1000
         }
-        || GenSocketfd <- Sockets
-    ],
-    {ok, {{one_for_one, 2, 2}, ChildSpecs}}.
+    ]} }.
 
 %%====================================================================
 %% Internal functions
 %%====================================================================
+
+start_resolver(Mod, Owner, Opts) ->
+    Mod:start_link(Owner, Opts).

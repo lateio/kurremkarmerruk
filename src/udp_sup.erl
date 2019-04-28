@@ -3,7 +3,7 @@
 %% @end
 %%%-------------------------------------------------------------------
 
--module(pool_worker_sup).
+-module(udp_sup).
 
 -behaviour(supervisor).
 
@@ -28,13 +28,20 @@ start_link() ->
 
 %% Child :: {Id,StartFunc,Restart,Shutdown,Type,Modules}
 init([]) ->
-    {ok, { {simple_one_for_one, 2, 2}, [
+    {ok, { {one_for_one, 2, 2}, [
         #{
-            id       => nil,
-            start    => {pool_worker, start_link, []},
-            type     => worker,
-            restart  => permanent,
-            shutdown => brutal_kill
+            id => udp_socket_control_server,
+            start => {udp_socket_control_server, start_link, []},
+            type => worker,
+            restart => permanent,
+            shutdown => 2000
+        },
+        #{
+            id => udp_socket_worker_sup,
+            start => {udp_socket_worker_sup, start_link, []},
+            type => supervisor,
+            restart => permanent,
+            shutdown => 5000
         }
     ]} }.
 

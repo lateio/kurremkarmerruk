@@ -1,32 +1,26 @@
 % ------------------------------------------------------------------------------
 %
-% Copyright (c) 2018, Lauri Moisio <l@arv.io>
+% Copyright © 2018-2019, Lauri Moisio <l@arv.io>
 %
-% The MIT License
+% The ISC License
 %
-% Permission is hereby granted, free of charge, to any person obtaining a copy
-% of this software and associated documentation files (the "Software"), to deal
-% in the Software without restriction, including without limitation the rights
-% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-% copies of the Software, and to permit persons to whom the Software is
-% furnished to do so, subject to the following conditions:
+% Permission to use, copy, modify, and/or distribute this software for any
+% purpose with or without fee is hereby granted, provided that the above
+% copyright notice and this permission notice appear in all copies.
 %
-% The above copyright notice and this permission notice shall be included in
-% all copies or substantial portions of the Software.
-%
-% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-% THE SOFTWARE.
+% THE SOFTWARE IS PROVIDED “AS IS” AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+% WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+% MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+% ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+% WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+% ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+% OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 %
 % ------------------------------------------------------------------------------
 %
 -module(kurremkarmerruk_cache).
 -behavior(kurremkarmerruk_handler).
--export([execute/2,valid_opcodes/0,config_keys/0,config_init/1,handle_config/3,config_end/1]).
+-export([execute/2,valid_opcodes/0,config_keys/0,config_init/1,handle_config/3,config_end/1,spawn_handler_proc/0]).
 
 -behavior(gen_server).
 -export([init/1,code_change/3,terminate/2,handle_call/3,handle_cast/2,handle_info/2]).
@@ -37,15 +31,19 @@
     store_resources/2,
     %store_negative/2,
     store_interpret_results/2,
+    lookup_resource/1,
     lookup_resource/2,
+    delete_cache/0,
     %lookup_ns/2,
     cache_namespace/1,
     cache_invalidator/3,
     execute_query/2
+    %keep_cached/2
 ]).
 
 -include_lib("dnslib/include/dnslib.hrl").
 
+spawn_handler_proc() -> false.
 valid_opcodes() -> query.
 config_keys() -> [cache].
 
@@ -60,7 +58,9 @@ default_cache_config() ->
         negative_caching => true,
         opts => [],
         private => false,
-        cache_id => default
+        cache_id => default,
+        cache_unknown_type => false,
+        cache_unknown_class => false
     }.
 
 
@@ -85,7 +85,8 @@ namespace_cache_enabled(#{cache_config := _}) -> true;
 namespace_cache_enabled(_) -> false.
 
 
-execute(Msg = #{'Questions' := Questions}, Namespace = #{cache_config := _}) ->
+execute(Msg = #{questions := Questions}, Namespace = #{cache_config := _}) ->
+% Don't consider cache if recursion is not desired?
     Answers = execute_query(Questions, Namespace),
     {ok, kurremkarmerruk_handler:add_answers(Answers, false, Msg)};
 execute(Msg, _) ->
@@ -104,10 +105,10 @@ check_cache([], _, Namespace, _, Acc) ->
         true -> kurremkarmerruk_zone:override_authoritative(Acc, Namespace, []);
         false -> Acc
     end;
-check_cache([Entry|Questions], NSID, Namespace, ZoneAvailable, Acc0) ->
+check_cache([Entry|Questions], CacheId, Namespace, ZoneAvailable, Acc0) ->
     % Check if Entry type is actually cacheable
     % What if Entry type all/maila? Or class is any?
-    Acc1 = case lookup_resource(NSID, Entry) of
+    Acc1 = case lookup_resource(Entry, [{namespace, Namespace}]) of
         [] -> Acc0;
         {{name_error, Soa}, CaseAnswers} ->
             [{Entry, name_error, {Soa, CaseAnswers}}|Acc0];
@@ -127,13 +128,16 @@ check_cache([Entry|Questions], NSID, Namespace, ZoneAvailable, Acc0) ->
                         [{_, nodata, {Soa, ZoneResources}}] -> {Entry, name_error, {Soa, lists:append(ZoneResources, CacheResources)}};
                         [{_, cname, {ZoneCnameRr, ZoneResources}}] -> {Entry, cname, {ZoneCnameRr, lists:append(ZoneResources, CacheResources)}};
                         [{_, cname_loop, ZoneResources}] -> {Entry, cname_loop, lists:append(ZoneResources, CacheResources)};
-                        [{_, cname_referral, {ZoneCnameRr, ZoneReferral, ZoneResources}}] -> {Entry, cname_referral, {ZoneCnameRr, ZoneReferral, lists:append(ZoneResources, CacheResources)}}
+                        [{_, cname_referral, {ZoneCnameRr, ZoneReferral, ZoneResources}}] -> {Entry, cname_referral, {ZoneCnameRr, ZoneReferral, lists:append(ZoneResources, CacheResources)}};
+                        [{_, referral, ZoneReferrals}] -> {Entry, referral, ZoneReferrals};
+                        [{_, addressless_referral, ZoneReferrals}] -> {Entry, addressless_referral, ZoneReferrals}
+                        % What about just plain referrals?
                     end;
                 Res -> Res
             end,
-            check_cache(Questions, NSID, Namespace, ZoneAvailable, [Tuple|Acc0])
+            check_cache(Questions, CacheId, Namespace, ZoneAvailable, [Tuple|Acc0])
     end,
-    check_cache(Questions, NSID, Namespace, ZoneAvailable, Acc1).
+    check_cache(Questions, CacheId, Namespace, ZoneAvailable, Acc1).
 
 
 % Referrals?
@@ -149,16 +153,21 @@ produce_cache_return(Question, Resources) ->
 %%
 %%
 
--record(server_state, {tab, trie=dnstrie:new(), invalidator_ref, authority_cache_refresh_timer}).
+-record(server_state, {
+    tab,
+    trie=dnstrie:new(),
+    invalidator,
+    invalidator_ref,
+    invalidator_mon
+}).
 
 
 init([]) ->
     process_flag(trap_exit, true),
     Tab = ets:new(dns_cache, [named_table, ordered_set]),
     timer:send_interval(timer:minutes(1), invalidate_cache),
-    Namespaces = kurremkarmerruk_server:namespaces(),
-    State = init_authority_root(#server_state{tab=Tab}),
-    {ok, init_namespace_caches(maps:to_list(Namespaces), State)}.
+    State = #server_state{tab=Tab}, % init_authority_root(#server_state{tab=Tab}),
+    {ok, State}.
 
 
 code_change(_OldVsn, _State, _Extra) ->
@@ -169,37 +178,37 @@ terminate(_Reason, _State) ->
     ok.
 
 
-handle_call({store, NamespaceId, Entries}, _, State = #server_state{tab=Tab, trie=Trie}) ->
-    Ttl = case maps:get(NamespaceId, kurremkarmerruk_server:namespaces_id_keyed(), undefined) of
-        undefined -> 86400; % 1 Day
-        Namespace -> maps:get(max_ttl, Namespace)
-    end,
-    {reply, ok, State#server_state{trie=store_resources(Entries, namespace:id(NamespaceId), Tab, Trie, Ttl)}};
-handle_call({store_interpret_result, NamespaceId, Results}, _, State = #server_state{tab=Tab, trie=Trie}) ->
-    {Ttl, TtlNeg} = case maps:get(NamespaceId, kurremkarmerruk_server:namespaces_id_keyed(), undefined) of
-        undefined -> {86400, 86400};
-        Namespace -> {maps:get(max_ttl, Namespace), maps:get(max_negative_ttl, Namespace)}
-    end,
-    {reply, ok, State#server_state{trie=store_interpret_results(Results, namespace:id(NamespaceId), Tab, Trie, Ttl, TtlNeg)}};
+handle_call({store, Namespace, Entries}, _, State = #server_state{tab=Tab, trie=Trie}) ->
+    CacheConfig = maps:get(cache_config, Namespace),
+    Ttl = maps:get(max_ttl, CacheConfig, 86400),
+    CacheId = maps:get(cache_id, CacheConfig),
+    {reply, ok, State#server_state{trie=store_resources(Entries, CacheId, Tab, Trie, Ttl)}};
+handle_call({store_interpret_result, Namespace, Results}, _, State = #server_state{tab=Tab, trie=Trie}) ->
+    CacheConfig = maps:get(cache_config, Namespace),
+    {Ttl, TtlNeg} = {maps:get(max_ttl, CacheConfig, 86400), maps:get(max_negative_ttl, Namespace, 86400)},
+    CacheId = maps:get(cache_id, CacheConfig),
+    {reply, ok, State#server_state{trie=store_interpret_results(Results, CacheId, Tab, Trie, Ttl, TtlNeg)}};
 handle_call(_Msg, _From, _State) ->
     {noreply, _State}.
 
+
+handle_cast({delete_cache, '_'}, State = #server_state{tab=Tab}) ->
+    true = ets:delete_all_objects(Tab),
+    {noreply, State};
 handle_cast(_Msg, _State) ->
     {noreply, _State}.
 
-handle_info(refresh_authority_cache, State) ->
-    {noreply, init_authority_root(State)};
-handle_info(invalidate_cache, State = #server_state{tab=Tab,invalidator_ref=undefined}) ->
+
+handle_info(invalidate_cache, State = #server_state{tab=Tab,invalidator_ref=undefined,invalidator=undefined}) ->
     Ref = make_ref(),
-    spawn_link(?MODULE, cache_invalidator, [self(), Ref, Tab]),
-    {noreply, State#server_state{invalidator_ref=Ref}};
+    {Invalidator, Mon} = spawn_monitor(?MODULE, cache_invalidator, [self(), Ref, Tab]),
+    {noreply, State#server_state{invalidator_ref=Ref,invalidator=Invalidator,invalidator_mon=Mon}};
 handle_info({cache_invalidator_res, Ref, Drop, Check}, State = #server_state{tab=Tab,invalidator_ref=Ref}) ->
-    % How would we know to apply cache policies for invalidations?
-    % Cache entries should contain some indication of the cache
-    % they belong to...
     [ets:delete(Tab, GenKey) || GenKey <- Drop],
     cache_invalidate_check(Check, Tab, nowts()),
-    {noreply, State#server_state{invalidator_ref=undefined}};
+    {noreply, State#server_state{invalidator=undefined}};
+handle_info({'DOWN', Mon, process, Invalidator, _}, State = #server_state{invalidator=Invalidator,invalidator_mon=Mon}) ->
+    {noreply, State#server_state{invalidator_mon=undefined,invalidator=undefined}};
 handle_info(_Msg, _State) ->
     {noreply, _State}.
 
@@ -294,27 +303,38 @@ prune_old_types([{Type, TypeRrs0}|Rest], Now, Acc) ->
     prune_old_types(Rest, Now, [{Type, TypeRrs}|Acc]).
 
 
-store_resources(Namespace = #{cache_config := #{cache_id := Id}}, Resources0) when is_list(Resources0) ->
-    Resources = case kurremkarmerruk_zone:namespace_zone_enabled(Namespace) of
-        true -> [GenTuple || GenTuple <- Resources0, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple))];
+store_resources(Namespace = #{cache_config := #{cache_unknown_type := UnknownType, cache_unknown_class := UnknownClass}}, Resources0) when is_list(Resources0) ->
+    Resources1 = case kurremkarmerruk_zone:namespace_zone_enabled(Namespace) of
+        true -> [GenTuple || GenTuple <- Resources0, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)];
         false -> Resources0
     end,
-    gen_server:call(?MODULE, {store, Id, Resources});
-store_resources(NamespaceId, Resources) when is_list(Resources), is_atom(NamespaceId) ->
-    gen_server:call(?MODULE, {store, NamespaceId, Resources});
-store_resources(Namespace, Resource) ->
+    Resources2 = case {UnknownType, UnknownClass} of
+        {true, true} -> Resources1;
+        {false, true} -> [GenTuple || GenTuple <- Resources1, is_atom(element(2, GenTuple))];
+        {true, false} -> [GenTuple || GenTuple <- Resources1, is_atom(element(3, GenTuple))];
+        {false, false} -> [GenTuple || GenTuple <- Resources1, is_atom(element(2, GenTuple)), is_atom(element(3, GenTuple))]
+    end,
+    % How to avoid storing the same resource multiple times...
+    gen_server:call(?MODULE, {store, Namespace, Resources2});
+%store_resources(NamespaceId, Resources) when is_list(Resources), is_atom(NamespaceId) ->
+%    gen_server:call(?MODULE, {store, NamespaceId, Resources});
+store_resources(Namespace, Resource) when not is_list(Resource) ->
     store_resources(Namespace, [Resource]).
 
 
-store_interpret_results(Namespace = #{cache_config := #{cache_id := Id}}, Results0) when is_list(Results0) ->
-    Results = case kurremkarmerruk_zone:namespace_zone_enabled(Namespace) of
+store_interpret_results(Namespace = #{cache_config := #{cache_unknown_type := UnknownType, cache_unknown_class := UnknownClass}}, Results0) when is_list(Results0) ->
+    Results1 = case kurremkarmerruk_zone:namespace_zone_enabled(Namespace) of
         true -> prune_authoritative_from_results(Results0, Namespace, []);
         false -> Results0
     end,
-    gen_server:call(?MODULE, {store_interpret_result, Id, Results});
-store_interpret_results(NamespaceId, Results) when is_list(Results), is_atom(NamespaceId) ->
-    gen_server:call(?MODULE, {store_interpret_result, NamespaceId, Results});
-store_interpret_results(Namespace, Result) ->
+    Results2 = case {UnknownType, UnknownClass} of
+        {true, true} -> Results1;
+        _ -> prune_unknown_from_results(Results1, UnknownType, UnknownClass, [])
+    end,
+    gen_server:call(?MODULE, {store_interpret_result, Namespace, Results2});
+%store_interpret_results(NamespaceId, Results) when is_list(Results), is_atom(NamespaceId) ->
+%    gen_server:call(?MODULE, {store_interpret_result, NamespaceId, Results});
+store_interpret_results(Namespace, Result) when not is_list(Result) ->
     store_interpret_results(Namespace, [Result]).
 
 
@@ -324,81 +344,110 @@ prune_authoritative_from_results([Tuple|Rest], Namespace, Acc) ->
     % This is awful. Should come up with a consistent way of handling cases like this.
     % But is pruning authoritative needed anywhere else?
     case Tuple of
-        {_, ok, Resources} -> prune_authoritative_from_results(Rest, Namespace, [setelement(3, Tuple, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)])|Acc]);
+        {_, ok, Resources} -> prune_authoritative_from_results(Rest, Namespace, [setelement(3, Tuple, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)])|Acc]);
         {Question, TupleState, {SoaRr, Resources}} when TupleState =:= nodata; TupleState =:= name_error ->
             case Resources of
                 [] ->
-                    case kurremkarmerruk_zone:authoritative_for(element(1, Question), Namespace) of
+                    case kurremkarmerruk_zone:authoritative_for(Question, Namespace) of
                         true -> prune_authoritative_from_results(Rest, Namespace, Acc);
                         false -> prune_authoritative_from_results(Rest, Namespace, [Tuple|Acc])
                     end;
-                [{_, cname, _, _, CanonDomain}|ResourcesTail] ->
-                    case kurremkarmerruk_zone:authoritative_for(CanonDomain, Namespace) of
+                [{_, cname, _, _, CanonDomain}=CnameRr|ResourcesTail] ->
+                    case kurremkarmerruk_zone:authoritative_for(setelement(1, CnameRr, CanonDomain), Namespace) of
                         true -> % Make answer into an ok, drop canon and prune others
-                            Tuple1 = {Question, ok, [GenTuple || GenTuple <- ResourcesTail, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)]},
+                            Tuple1 = {Question, ok, [GenTuple || GenTuple <- ResourcesTail, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)]},
                             prune_authoritative_from_results(Rest, Namespace, [Tuple1|Acc]);
                         false ->
                             % If we take away the most recent cname, and there's still one
                             % after that, the whole meaning of the answer changes...
                             % Thus we have to split the result
                             Tuple1 = {setelement(1, Question, CanonDomain), TupleState, {SoaRr, []}},
-                            prune_authoritative_from_results(Rest, Namespace, [{Question, ok, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)]}, Tuple1|Acc])
+                            prune_authoritative_from_results(Rest, Namespace, [{Question, ok, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)]}, Tuple1|Acc])
                     end
             end;
         % Referrals
         {_, referral, [{NsRr, _}|_] = Resources} ->
-            case kurremkarmerruk_zone:authoritative_for(element(1, NsRr), Namespace) of
+            case kurremkarmerruk_zone:authoritative_for(NsRr, Namespace) of
                 true -> prune_authoritative_from_results(Rest, Namespace, Acc);
                 false ->
-                    Fn = fun ({FunNsRr, _}) -> {FunNsRr, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)]} end,
+                    Fn = fun ({FunNsRr, FunNsResources}) -> {FunNsRr, [GenTuple || GenTuple <- FunNsResources, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)]} end,
                     Tuple1 = setelement(3, Tuple, lists:map(Fn, Resources)),
                     prune_authoritative_from_results(Rest, Namespace, [Tuple1|Acc])
             end;
         {_, addressless_referral, [NsRr|_]} ->
-            case kurremkarmerruk_zone:authoritative_for(element(1, NsRr), Namespace) of
+            case kurremkarmerruk_zone:authoritative_for(NsRr, Namespace) of
                 true -> prune_authoritative_from_results(Rest, Namespace, Acc);
                 false -> prune_authoritative_from_results(Rest, Namespace, [Tuple|Acc])
             end;
         {Question, cname, {CnameRr, Resources}} -> % What do?
-            case kurremkarmerruk_zone:authoritative_for(element(1, CnameRr), Namespace) of
+            case kurremkarmerruk_zone:authoritative_for(CnameRr, Namespace) of
                 true ->
-                    Tuple1 = {Question, ok, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)]},
+                    Tuple1 = {Question, ok, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)]},
                     prune_authoritative_from_results(Rest, Namespace, [Tuple1|Acc]);
                 false ->
-                    Tuple1 = setelement(3, Tuple, {CnameRr, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)]}),
+                    Tuple1 = setelement(3, Tuple, {CnameRr, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)]}),
                     prune_authoritative_from_results(Rest, Namespace, [Tuple1|Acc])
             end;
         {_, cname_loop, Resources} -> % What do?
-            Tuple1 = setelement(3, Tuple, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(element(1, GenTuple), Namespace)]),
+            Tuple1 = setelement(3, Tuple, [GenTuple || GenTuple <- Resources, not kurremkarmerruk_zone:authoritative_for(GenTuple, Namespace)]),
             prune_authoritative_from_results(Rest, Namespace, [Tuple1|Acc]);
         {Question, cname_referral, {CnameRr, Referral, Resources}} -> % What do?
             Tuple1 = {Question, cname, {CnameRr, Resources}},
             prune_authoritative_from_results([Referral, Tuple1|Rest], Namespace, Acc);
-        _ -> prune_authoritative_from_results(Rest, Namespace, [Tuple|Acc])
+        {Question, _Error}=Tuple ->
+            case kurremkarmerruk_zone:authoritative_for(Question, Namespace) of
+                true -> prune_authoritative_from_results(Rest, Namespace, Acc);
+                false -> prune_authoritative_from_results(Rest, Namespace, [Tuple|Acc])
+            end
+        % What is the last case pattern for?
+        %_ -> prune_authoritative_from_results(Rest, Namespace, [Tuple|Acc])
     end.
 
 
-lookup_resource(NamespaceId, Question) ->
-    lookup_resource(NamespaceId, Question, erlang:monotonic_time(second), []).
+prune_unknown_from_results([], _, _, Acc) ->
+    Acc;
+prune_unknown_from_results([Result|Rest], UnknownType, false, Acc) ->
+    % We can straight up drop answers based on question class
+    Question = element(1, Result),
+    case is_atom(element(3, Question)) of
+        true when UnknownType -> prune_unknown_from_results(Rest, UnknownType, false, [Result|Acc]);
+        true when not UnknownType -> prune_unknown_from_results(Rest, UnknownType, false, prune_unknown_from_results([Result], UnknownType, true, Acc));
+        false -> prune_unknown_from_results(Rest, UnknownType, false, Acc)
+    end;
+prune_unknown_from_results([Result|Rest], false, true, Acc) ->
+    % Unknown types can really only present in ok and nodata...
+    case Result of
+        {_, ok, Resources} -> prune_unknown_from_results(Rest, false, true, [setelement(3, Result, [GenTuple || GenTuple <- Resources, is_atom(element(2, GenTuple))])|Acc]);
+        {{_, Type, _}=Question, nodata, {_, Resources}} when is_integer(Type) -> prune_unknown_from_results(Rest, false, true, [{Question, ok, Resources}|Acc]);
+        _ -> prune_unknown_from_results(Rest, false, true, [Result|Acc])
+    end.
 
-lookup_resource(NamespaceId0, {Domain, Type, Class}=Question, Now, Acc) ->
-    NamespaceId1 = namespace:id(NamespaceId0),
-    case is_name_error(NamespaceId1, Domain, Class, Now, true) of
+
+lookup_resource(Question) ->
+    lookup_resource(Question, [{namespace, namespace:internal()}]).
+
+lookup_resource(Question, Opts) ->
+    lookup_resource(Question, Opts, erlang:monotonic_time(second), []).
+
+lookup_resource({Domain, Type, Class}=Question, Opts, Now, Acc) ->
+    #{cache_config := #{cache_id := CacheId}} = proplists:get_value(namespace, Opts),
+    case is_name_error(CacheId, Domain, Class, Now, true) of
         {true, Deadline, Soa} -> {{name_error, setelement(4, Soa, valid_for(Now, Deadline))}, prune_old_entries(Acc)};
-        {false, _NsRecord} ->
-            Id = namespace:domain_hash(Domain, NamespaceId1),
+        %{false, _NsRecord} ->
+        _FalseRes ->
+            Id = namespace:domain_hash(Domain, CacheId),
             case ets:lookup(dns_cache, Id) of
                 [] -> prune_old_entries(Acc);
                 [{Id, ValidUntil, _}] when Now > ValidUntil -> prune_old_entries(Acc);
                 [{Id, _, Map}] ->
                     case maps:get(Class, Map, #{}) of
-                        #{Type := {nodata, TypeValidUntil, _}} when Now > TypeValidUntil -> prune_old_entries(Acc);
-                        #{Type := {nodata, TypeValidUntil, Soa}} -> {{nodata, setelement(4, Soa, valid_for(Now, TypeValidUntil))}, prune_old_entries(Acc)};
+                        #{Type := {_ErrorType, TypeValidUntil, _}} when Now > TypeValidUntil -> prune_old_entries(Acc);
+                        #{Type := {ErrorType, TypeValidUntil, Soa}} -> {{ErrorType, setelement(4, Soa, valid_for(Now, TypeValidUntil))}, prune_old_entries(Acc)};
                         #{Type := Entries0} -> prune_old_entries(lists:append(Entries0, Acc));
                         #{cname := [{_, _, _, _, CnameDomain}=Entry]} ->
                             case kurremkarmerruk_utils:cname_resource_loop([Entry|Acc]) of
                                 true -> {Question, cname_loop, prune_old_entries([Entry|Acc])};
-                                false -> lookup_resource(NamespaceId0, {CnameDomain, Type, Class}, Now, [Entry|Acc])
+                                false -> lookup_resource({CnameDomain, Type, Class}, Opts, Now, [Entry|Acc])
                             end;
                         #{} -> prune_old_entries(Acc)
                     end
@@ -433,6 +482,11 @@ is_name_error(NamespaceId, Domain, Class, Now, CatchNsRecord) ->
 
 cache_namespace(Namespace) ->
     erlang:phash2(Namespace).
+
+
+delete_cache() ->
+    gen_server:cast(?MODULE, {delete_cache, '_'}).
+
 
 %%%%
 
@@ -479,7 +533,11 @@ store_resources([{Domain, Type, Class, Ttl0, Data}|Entries], NamespaceId, Tab, T
                             Now = nowts(),
                             TypeRrs = case Type of
                                 soa -> [{Domain, Type, Class, NewValidUntil, Data}];
-                                _ -> [{Domain, Type, Class, NewValidUntil, Data}|[GenTuple || GenTuple <- TypeRrs0, element(4, GenTuple) > Now]]
+                                _ ->
+                                    case [Data] -- [?RESOURCE_DATA(GenTuple) || GenTuple <- TypeRrs0] of
+                                        [] -> TypeRrs0;
+                                        _ -> [{Domain, Type, Class, NewValidUntil, Data}|[GenTuple || GenTuple <- TypeRrs0, element(4, GenTuple) > Now]]
+                                    end
                             end,
                             Map = Map0#{Class => ClassMap#{Type => TypeRrs}},
                             Updates =
@@ -557,49 +615,9 @@ nowts() ->
     erlang:monotonic_time(second).
 
 
-init_authority_root(State = #server_state{tab=Tab,trie=Trie0}) ->
-    case
-        case application:get_env(root_server_hints) of
-            {ok, {priv_file, App, File}}          -> {path, filename:join(code:priv_dir(App), File), []};
-            {ok, {priv_file, App, File, TmpOpts}} -> {path, filename:join(code:priv_dir(App), File), TmpOpts};
-            {ok, {file, TmpPath}}                 -> {path, TmpPath, []};
-            {ok, {file, TmpPath, TmpOpts}}        -> {path, TmpPath, TmpOpts}
-        end
-    of
-        {path, Path, Opts} ->
-            case dnsfile:consult(Path, Opts) of
-                {error, Reason} ->
-                    error_logger:error_msg("~s~n", [dnserror_format:consult_error(Reason)]),
-                    State;
-                {ok, Rrs} ->
-                    [{_, _, _, MinTtl, _}|_] = lists:sort(fun ({_, _, _, GenTtl1, _}, {_, _, _, GenTtl2, _}) -> GenTtl1 < GenTtl2 end, Rrs),
-                    case MinTtl of
-                        _ when MinTtl > 1 ->
-                            Trie1 = store_resources(Rrs, default, Tab, Trie0, ?MAX_TTL),
-                            Timer = timer:send_after(timer:seconds(MinTtl div 2), refresh_authority_cache),
-                            State#server_state{trie=Trie1,authority_cache_refresh_timer=Timer}
-                    end
-            end
-    end.
-
-
-init_namespace_caches([], State) ->
-    State;
-init_namespace_caches([{_, Netmasks}|Namespaces], State) when is_list(Netmasks) ->
-    init_namespace_caches(Namespaces, init_namespace_caches(Netmasks, State));
-init_namespace_caches([{_Id0, Settings}|Namespaces], State) ->
-    case Settings of
-        #{cache := private} ->
-            RootFile = filename:join(code:priv_dir(kurremkarmerruk), "root"),
-            {ok, _Rrs} = dnsfile:consult(RootFile, [{class, in}]),
-            init_namespace_caches(Namespaces, State);
-        _ -> init_namespace_caches(Namespaces, State)
-    end.
-
-
 prune_old_entries(Entries) ->
     Now = nowts(),
     [
         {EntryDomain, Type, Class, ValidUntil - Now, Data} ||
-        {EntryDomain, Type, Class, ValidUntil, Data} <- Entries, Now =< ValidUntil orelse ValidUntil =:= forever
+        {EntryDomain, Type, Class, ValidUntil, Data} <- Entries, Now =< ValidUntil
     ].
